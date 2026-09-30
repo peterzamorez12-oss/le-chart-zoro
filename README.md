@@ -1,2 +1,0 @@
-# le-chart-zoro
-Bot
