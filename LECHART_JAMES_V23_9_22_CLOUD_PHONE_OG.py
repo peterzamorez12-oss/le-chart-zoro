@@ -202,8 +202,15 @@ class _MobileRoot(_MobileDummy):
                 ran=True
             time.sleep(0.01 if ran else 0.025)
 
+class _MobilePhotoImage:
+    # Headless/cloud builds cannot decode Tk images. Raising is intentional:
+    # legacy GIF-frame scanners use the first decode failure as end-of-GIF.
+    def __init__(self, *a, **k):
+        raise RuntimeError('PhotoImage unavailable in headless/cloud runtime')
+
 class _MobileTkModule:
     Tk=_MobileRoot; Toplevel=_MobileDummy; Frame=_MobileDummy; LabelFrame=_MobileDummy
+    PhotoImage=_MobilePhotoImage
     Label=_MobileDummy; Button=_MobileDummy; Entry=_MobileDummy; Canvas=_MobileDummy
     Scrollbar=_MobileDummy; Text=_MobileDummy; Listbox=_MobileDummy; Scale=_MobileDummy
     Checkbutton=_MobileDummy; Radiobutton=_MobileDummy; Menu=_MobileDummy; PanedWindow=_MobileDummy
