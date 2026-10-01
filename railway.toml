@@ -3,5 +3,9 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
+# Explicitly override any stale Start Command left on the existing Railway service.
+startCommand = "python3 /app/railway_desktop_launcher.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+healthcheckPath = "/"
+healthcheckTimeout = 120
