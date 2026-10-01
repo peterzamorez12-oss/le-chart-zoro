@@ -51616,7 +51616,7 @@ def _v280_forecast_read(self, now=None, force=False):
     comps['EXACT_6TF_WEDGE']={'score':m,'weight':blend,'side':mtf.get('side'),'agreement':agreement,'coverage':coverage}
     fc['components']=comps
     fc['reason']=(str(fc.get('reason',''))+f' • EXACT 3m/5m/10m/15m/1h/4h {mtf.get("side","MIXED")} {m:+.2f} '
-                  f'({agreement*100:.0f}% agree) • '+(' / '.join(f"{w.get("tf")} {w.get("name")} {"BREAK" if w.get("confirmed") else "FORMING"}" for w in (mtf.get('wedges') or [])[:3]) or 'no wedge'))
+                  f'({agreement*100:.0f}% agree) • '+(' / '.join(f"{w.get('tf')} {w.get('name')} {'BREAK' if w.get('confirmed') else 'FORMING'}" for w in (mtf.get('wedges') or [])[:3]) or 'no wedge'))
     return fc
 
 
@@ -63022,8 +63022,8 @@ def _v232_dashboard_tick(app):
         elif live is not None and ceil is not None and abs(live-float(ceil))<=max(8.0,abs(live-(target or live))*.25):V['scalp'].set('WATCH CEILING REACTION');V['scalpmeta'].set(f'near mapped ceiling ${float(ceil):,.0f} • wait for reject/accept before acting')
         else:V['scalp'].set('WAIT — NO CLEAN SECOND CHANCE');V['scalpmeta'].set('price is between mapped decision points')
         V['value'].set(f'WINDOW OPEN — {into/60:.1f} / 5.0 MIN' if into<=300 else 'WINDOW CLOSED — T+5:00 REACHED');V['valuemeta'].set('MAIN LOCK can earn at any moment now' if into<=300 else 'no brand-new first lock after five minutes • journey + flips keep running')
-        V['toproute'].set(f'Route {side if side in ('UP','DOWN') else 'WAIT'} • edge {comp:+.3f} • reversal {meter:.0f}/100')
-        V['toproute2'].set(f'floor {float(floor):,.0f} • ceiling {float(ceil):,.0f} • regime {reg.get('name','MIXED')}' if floor is not None and ceil is not None else f'regime {reg.get('name','MIXED')} • levels still building')
+        V['toproute'].set(f"Route {side if side in ('UP','DOWN') else 'WAIT'} • edge {comp:+.3f} • reversal {meter:.0f}/100")
+        V['toproute2'].set(f"floor {float(floor):,.0f} • ceiling {float(ceil):,.0f} • regime {reg.get('name','MIXED')}" if floor is not None and ceil is not None else f"regime {reg.get('name','MIXED')} • levels still building")
         # V23.4 dedicated telemetry tick owns all Storm Grid fields.
         V['mentorread'].set(f'MENTOR READ • {reg.get("name","MIXED")} • MBI {ms:+.0f} • TUG {tside} {max(upf,100-upf):.0f}%')
         V['engine'].set(f'{side} • {strength:.0f}/100' if side in ('UP','DOWN') else f'WAIT • route {comp:+.2f}')
