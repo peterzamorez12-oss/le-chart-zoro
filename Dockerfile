@@ -3,6 +3,6 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
-COPY LECHART_JAMES_V23_9_67_RAILWAY_COINBASE_MACHINE.py /app/LECHART_JAMES_V23_9_67_RAILWAY_COINBASE_MACHINE.py
+COPY app.py /app/app.py
 EXPOSE 8080
-CMD ["python", "/app/LECHART_JAMES_V23_9_67_RAILWAY_COINBASE_MACHINE.py"]
+CMD ["python", "/app/app.py"]
