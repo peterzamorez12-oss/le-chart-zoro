@@ -73759,6 +73759,517 @@ def _v23969_init(self,*a,**k):
             except Exception:pass
 ChartKingPro.__init__=_v23969_init
 
+
+
+def _v23975_clamp(v, lo, hi):
+    return max(lo, min(hi, float(v)))
+
+def _v23975_num(x):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+def _v23975_cdf(z):
+    return 0.5 * math.erfc(-float(z) / math.sqrt(2.0))
+
+def _v23975_normal_up(mean, sd, strike):
+    if sd <= 1e-12:
+        return float(mean > strike) if mean != strike else 0.5
+    return _v23975_clamp(_v23975_cdf((mean - strike) / sd), 0.0, 1.0)
+
+def _v23975_normalize_bars(raw):
+    """Closed candlesticks only; caller excludes the latest still-forming bar."""
+    out = []
+    for c in raw or ():
+        if not isinstance(c, dict):
+            continue
+        try:
+            o, h, l, z = [_v23975_num(c.get(k, c.get(k[0]))) for k in ('open', 'high', 'low', 'close')]
+            if any((v is None for v in (o, h, l, z))) or l <= 0 or h < l or (not (l <= o <= h and l <= z <= h)):
+                continue
+            out.append({'open': o, 'high': h, 'low': l, 'close': z, 'volume': max(0.0, _v23975_num(c.get('volume', c.get('v'))) or 0.0)})
+        except Exception:
+            continue
+    return out
+
+def _v23975_pivots(bars, left=2, right=2):
+    """Pivots are CONFIRMED only after `right` additional CLOSED bars."""
+    highs, lows = ([], [])
+    if len(bars) < left + right + 1:
+        return (highs, lows)
+    for i in range(left, len(bars) - right):
+        a = bars[i - left:i + right + 1]
+        h = bars[i]['high']
+        l = bars[i]['low']
+        if all((h >= x['high'] for x in a)) and any((h > x['high'] for x in a)):
+            highs.append((i, h))
+        if all((l <= x['low'] for x in a)) and any((l < x['low'] for x in a)):
+            lows.append((i, l))
+    return (highs, lows)
+
+def _v23975_atr_dollars(bars, n=18):
+    if len(bars) < 2:
+        return None
+    ranges = []
+    for i in range(max(1, len(bars) - n), len(bars)):
+        b = bars[i]
+        pc = bars[i - 1]['close']
+        ranges.append(max(b['high'] - b['low'], abs(b['high'] - pc), abs(b['low'] - pc)))
+    return statistics.median(ranges) if ranges else None
+
+def _v23975_orderflow_snapshot(price, bids, asks, trades, now, depth_pct=0.0015):
+    """Executed flow versus resting depth. Coinbase L2 aggregate sizes can be canceled."""
+    if not price or price <= 0:
+        return {'ready': False, 'reason': 'NO PRICE'}
+    bd = ad = 0.0
+    bc = ac = 0
+    tol = price * depth_pct
+    for levels, is_bid in ((bids or {}, True), (asks or {}, False)):
+        if not isinstance(levels, dict):
+            continue
+        for px, row in levels.items():
+            pp = _v23975_num(px)
+            if pp is None or abs(pp - price) > tol or (is_bid and pp > price) or (not is_bid and pp < price):
+                continue
+            size = _v23975_num(row.get('size')) if isinstance(row, dict) else _v23975_num(row)
+            if size is None or size <= 0:
+                continue
+            if is_bid:
+                bd += size
+                bc += 1
+            else:
+                ad += size
+                ac += 1
+    buy = sell = 0.0
+    n = 0
+    for t in list(trades or [])[-2500:]:
+        tt = _v23975_num(t.get('received', t.get('ts'))) or 0
+        if now - tt < 0 or now - tt > 35.0:
+            continue
+        side = str(t.get('aggressor', '')).lower()
+        size = _v23975_num(t.get('size')) or 0
+        if side == 'buy':
+            buy += size
+            n += 1
+        elif side == 'sell':
+            sell += size
+            n += 1
+    imb = (bd - ad) / (bd + ad) if bd + ad > 1e-08 else None
+    delta = (buy - sell) / (buy + sell) if buy + sell > 1e-08 else None
+    return {'ready': imb is not None and delta is not None, 'bid_btc': bd, 'ask_btc': ad, 'buy_btc_35s': buy, 'sell_btc_35s': sell, 'book_imbalance': imb, 'executed_delta': delta, 'trade_count_35s': n, 'book_levels': bc + ac, 'caution': 'Visible L2 depth is cancellable; a wall is not a confirmed rejection.'}
+
+def _v23975_zone_structure(bars, price, flow):
+    if len(bars) < 12 or price is None:
+        return {'ready': False, 'reason': 'WAIT 12 CLOSED CANDLES', 'zone': None}
+    ah = _v23975_atr_dollars(bars) or price * 0.00025
+    tolerance = max(ah * 0.38, price * 7.5e-05)
+    hi, lo = _v23975_pivots(bars)
+    levels = [('RESISTANCE', k, p) for k, p in hi] + [('SUPPORT', k, p) for k, p in lo]
+    if not levels:
+        return {'ready': False, 'reason': 'WAIT CONFIRMED PIVOTS', 'zone': None}
+    best = None
+    for typ, idx, level in levels:
+        if typ == 'RESISTANCE' and level < price - tolerance:
+            continue
+        if typ == 'SUPPORT' and level > price + tolerance:
+            continue
+        touches = [(j, p) for t, j, p in levels if t == typ and abs(p - level) <= tolerance * 1.5]
+        n = len(touches)
+        distance = abs(level - price)
+        recency = (idx + 1) / max(1, len(bars))
+        strength = _v23975_clamp(12 + 18 * min(3, n) + 18 * recency + 15 * math.exp(-distance / (4 * ah)), 0, 100)
+        candidate = {'type': typ, 'center': level, 'low': level - tolerance, 'high': level + tolerance, 'touches': n, 'strength_score': round(strength, 1), 'distance_usd': round(distance, 2), 'origin': 'CONFIRMED SWING PIVOTS', 'atr': round(ah, 2)}
+        if best is None or distance / max(ah, 1) + 0.25 * (100 - strength) / 100 < best[0]:
+            best = (distance / max(ah, 1) + 0.25 * (100 - strength) / 100, candidate)
+    if best is None:
+        return {'ready': False, 'reason': 'NO UNBROKEN NEARBY ZONE', 'zone': None}
+    zone = best[1]
+    typ = zone['type']
+    lows = [b['low'] for b in bars[-7:]]
+    highs = [b['high'] for b in bars[-7:]]
+    higher_lows = sum((lows[i] > lows[i - 1] for i in range(1, len(lows)))) / 6.0
+    lower_highs = sum((highs[i] < highs[i - 1] for i in range(1, len(highs)))) / 6.0
+    price_push = (bars[-1]['close'] - bars[-7]['close']) / max(ah * 3, 0.01)
+    approach = _v23975_clamp(price_push, -1, 1) if typ == 'RESISTANCE' else _v23975_clamp(-price_push, -1, 1)
+    compression = higher_lows if typ == 'RESISTANCE' else lower_highs
+    direction = 1 if typ == 'RESISTANCE' else -1
+    delta = flow.get('executed_delta') if flow.get('trade_count_35s',0) >= 4 else None
+    ib = flow.get('book_imbalance') if flow.get('ready') else None
+    signed_flow = direction * (delta or 0)
+    opposing_resting = -direction * (ib or 0)
+    absorption = signed_flow > 0.2 and opposing_resting > 0.18 and (abs(price_push) < 0.6) and (flow.get('trade_count_35s', 0) >= 4)
+    breakout = _v23975_clamp(42 + 19 * approach + 15 * (compression - 0.5) * 2 + 14 * signed_flow - 10 * opposing_resting, 0, 100)
+    rejection = _v23975_clamp(42 - 16 * approach - 12 * (compression - 0.5) * 2 - 12 * signed_flow + 16 * opposing_resting + (9 if absorption else 0), 0, 100)
+    if max(breakout, rejection) < 53 or abs(breakout - rejection) < 13:
+        decision = 'UNCLEAR'
+    else:
+        decision = 'BREAK PRESSURE' if breakout > rejection else 'REJECTION PRESSURE'
+    return {'ready': True, 'zone': zone, 'break_score': round(breakout, 1), 'reject_score': round(rejection, 1), 'decision': decision, 'compression': round(compression, 3), 'approach': round(approach, 3), 'absorption_clue': bool(absorption), 'score_kind': 'HEURISTIC UNCALIBRATED - NOT % PROBABILITY'}
+
+def _v23975_pattern_candidates(bars):
+    """Lightweight, deterministic tentative patterns. Never label as completed without breakout."""
+    if len(bars) < 14:
+        return []
+    highs, lows = _v23975_pivots(bars)
+    atr = _v23975_atr_dollars(bars) or bars[-1]['close'] * 0.00025
+    close = bars[-1]['close']
+    out = []
+
+    def add(name, direction, neckline, note):
+        if neckline is None:
+            return
+        complete = close > neckline + 0.15 * atr if direction == 'UP' else close < neckline - 0.15 * atr
+        out.append({'name': name, 'direction': direction, 'state': 'BREAKOUT OBSERVED' if complete else 'FORMING', 'trigger': round(neckline, 2), 'detail': note})
+    if len(highs) >= 2:
+        (a, pa), (b, pb) = highs[-2:]
+        if b - a >= 3 and abs(pa - pb) < 0.65 * atr:
+            trough = min((x['low'] for x in bars[a:b + 1]))
+            if min(pa, pb) - trough >= 0.85 * atr:
+                add('DOUBLE TOP', 'DOWN', trough, 'Two confirmed highs; neckline below')
+    if len(lows) >= 2:
+        (a, pa), (b, pb) = lows[-2:]
+        if b - a >= 3 and abs(pa - pb) < 0.65 * atr:
+            peak = max((x['high'] for x in bars[a:b + 1]))
+            if peak - max(pa, pb) >= 0.85 * atr:
+                add('DOUBLE BOTTOM', 'UP', peak, 'Two confirmed lows; neckline above')
+    if len(highs) >= 3:
+        (a, p1), (b, p2), (c, p3) = highs[-3:]
+        if 2 <= b - a <= 20 and 2 <= c - b <= 20 and (p2 > max(p1, p3) + 0.4 * atr) and (abs(p1 - p3) < 1.0 * atr):
+            neck = min((x['low'] for x in bars[a:c + 1]))
+            add('HEAD & SHOULDERS', 'DOWN', neck, 'Right shoulder confirmed; break under neckline')
+    if len(lows) >= 3:
+        (a, p1), (b, p2), (c, p3) = lows[-3:]
+        if 2 <= b - a <= 20 and 2 <= c - b <= 20 and (p2 < min(p1, p3) - 0.4 * atr) and (abs(p1 - p3) < 1.0 * atr):
+            neck = max((x['high'] for x in bars[a:c + 1]))
+            add('INVERSE HEAD & SHOULDERS', 'UP', neck, 'Right shoulder confirmed; break over neckline')
+    if len(highs) >= 2 and len(lows) >= 2:
+        recenthi = highs[-3:]
+        recentlo = lows[-3:]
+        if abs(recenthi[-1][1] - recenthi[0][1]) < 0.55 * atr and recentlo[-1][1] > recentlo[0][1] + 0.55 * atr:
+            add('ASCENDING TRIANGLE', 'UP', max((p for _, p in recenthi)), 'Flat highs and rising confirmed lows')
+        if abs(recentlo[-1][1] - recentlo[0][1]) < 0.55 * atr and recenthi[-1][1] < recenthi[0][1] - 0.55 * atr:
+            add('DESCENDING TRIANGLE', 'DOWN', min((p for _, p in recentlo)), 'Flat lows and falling confirmed highs')
+    if len(bars) >= 16:
+        trend = bars[-8]['close'] - bars[-16]['close']
+        pull = bars[-1]['close'] - bars[-8]['close']
+        if abs(trend) > 2 * atr and trend * pull < 0 and (abs(pull) < abs(trend) * 0.7):
+            up = trend > 0
+            trigger = max((x['high'] for x in bars[-8:])) if up else min((x['low'] for x in bars[-8:]))
+            add('BULL FLAG' if up else 'BEAR FLAG', 'UP' if up else 'DOWN', trigger, 'Impulse followed by countertrend pullback')
+    if len(bars) >= 25:
+        seg = bars[-25:-5]
+        handle = bars[-5:]
+        left = sum((b['close'] for b in seg[:5])) / 5
+        mid = sum((b['close'] for b in seg[8:12])) / 4
+        right = sum((b['close'] for b in seg[-5:])) / 5
+        rim = max(left, right)
+        depth = rim - mid
+        hmid = min((b['low'] for b in handle))
+        if depth > 1.3 * atr and abs(left - right) < 1.1 * atr and (0.05 * depth < right - hmid < 0.65 * depth):
+            add('CUP & HANDLE', 'UP', max((b['high'] for b in seg)), 'Rounded base plus shallow handle candidate')
+    if len(highs) >= 3:
+        a, b, c = highs[-3:]
+        if c[0] - a[0] >= 7 and max((p for _, p in (a, b, c))) - min((p for _, p in (a, b, c))) < 0.75 * atr:
+            neck = min((x['low'] for x in bars[a[0]:c[0] + 1]))
+            add('TRIPLE TOP', 'DOWN', neck, 'Three tested upper swing levels')
+    if len(lows) >= 3:
+        a, b, c = lows[-3:]
+        if c[0] - a[0] >= 7 and max((p for _, p in (a, b, c))) - min((p for _, p in (a, b, c))) < 0.75 * atr:
+            neck = max((x['high'] for x in bars[a[0]:c[0] + 1]))
+            add('TRIPLE BOTTOM', 'UP', neck, 'Three tested lower swing levels')
+    if len(highs) >= 3 and len(lows) >= 3:
+        hs = highs[-3:]
+        ls = lows[-3:]
+        hrate = (hs[-1][1] - hs[0][1]) / max(1, hs[-1][0] - hs[0][0])
+        lrate = (ls[-1][1] - ls[0][1]) / max(1, ls[-1][0] - ls[0][0])
+        if hrate > 0 and lrate > hrate + 0.12 * atr:
+            add('RISING WEDGE', 'DOWN', min((p for _, p in ls)), 'Ascending contracting rails; bearish potential')
+        if lrate < 0 and hrate < lrate - 0.12 * atr:
+            add('FALLING WEDGE', 'UP', max((p for _, p in hs)), 'Descending contracting rails; bullish potential')
+    return out[:6]
+
+def _v23975_settlement_path(reference, strike, seconds_left, sigma_log_per_sqrt_sec, observed_final_avg=None, observed_final_count=0, drift_usd_per_s=0.0):
+    """Gaussian diffusion ESTIMATE of Kalshi final 60s index average, not a guarantee.
+
+    Opening and closing 60s averages are provided by Kalshi contract rules.
+    For X(t)=X0+mu*t+sigma*W(t), variance of a future 60s average
+    equals sigma^2 * (pre_window_wait + 60/3) before last minute.
+    Inside last minute, known samples are fixed and remaining integral
+    variance equals sigma^2 * remaining^3 / (3*60^2).
+    """
+    x, k, t, sig = map(_v23975_num, (reference, strike, seconds_left, sigma_log_per_sqrt_sec))
+    if x is None or k is None or t is None or (sig is None) or (min(x, k, sig) <= 0) or (t < 0):
+        return {'ready': False, 'reason': 'WAIT FRESH BRTI + VERIFIED STRIKE + REALIZED VOLATILITY'}
+    t = min(t, 900.0)
+    s = x * sig
+    mu = float(drift_usd_per_s or 0.0)
+    if t > 60.0:
+        mean = x + mu * (t - 30.0)
+        std = s * math.sqrt(max(0.0, t - 40.0))
+        basis = 'FUTURE FINAL-MINUTE 60S BRTI AVG'
+    else:
+        n = int(_v23975_clamp(observed_final_count or 0, 0, 60))
+        ave = _v23975_num(observed_final_avg)
+        if ave is None or n <= 0 or abs(n - (60 - t)) > 5:
+            mean = x + mu * t * 0.5
+            std = s * math.sqrt(max(0.0, t ** 3 / (3.0 * 60.0 ** 2)))
+            return {'ready': False, 'reason': 'FINAL MINUTE: WAIT OFFICIAL ACCUMULATING AVG', 'proxy_mean': round(mean, 3), 'proxy_std': round(std, 3)}
+        remaining = max(0, 60 - n)
+        mean = (n * ave + remaining * x + mu * remaining * remaining / 2.0) / 60.0
+        std = s * math.sqrt(remaining ** 3 / (3.0 * 60.0 ** 2))
+        basis = 'OFFICIAL PARTIAL FINAL-MINUTE BRTI AVG'
+    p = _v23975_normal_up(mean, std, k)
+    return {'ready': True, 'model_p_up': round(p, 4), 'model_p_down': round(1 - p, 4), 'mean_settle': round(mean, 3), 'std_settle': round(std, 3), 'basis': basis, 'kind': 'UNCALIBRATED GAUSSIAN PATH ESTIMATE', 'side': 'UP' if p > 0.55 else 'DOWN' if p < 0.45 else 'WAIT'}
+
+def _v23975_first_crossing_path(reference, strike, sigma_log, seconds_left):
+    """Brownian first-touch upper-bound baseline, NOT timed flips or empirical odds."""
+    x, k, ss, t = map(_v23975_num, (reference, strike, sigma_log, seconds_left))
+    if x is None or k is None or ss is None or (t is None) or (x <= 0) or (ss <= 0) or (t <= 0):
+        return {'ready': False}
+    gap = abs(x - k)
+    s = x * ss
+    horizons = sorted(set((int(max(1, min(t, h))) for h in (30, 60, 120, 300, t))))
+    rows = []
+    for h in horizons:
+        pr = _v23975_clamp(2.0 * (1.0 - _v23975_cdf(gap / (s * math.sqrt(h)))), 0.0, 1.0)
+        rows.append({'by_seconds': h, 'model_touch': round(pr, 4)})
+    return {'ready': True, 'gap_usd': round(gap, 2), 'horizons': rows, 'kind': 'MODEL FIRST-TOUCH OF STRIKE - NOT SETTLEMENT OR EXACT FLIP TIME'}
+
+def _v23975_score_snapshot(bars, bids, asks, trades, now, reference, strike, seconds_left, sigma, observed_avg=None, observed_n=0, price_source='BRTI', drift=0.0, zone_price=None, pattern_bars=None):
+    cb = _v23975_normalize_bars(bars)
+    zp = zone_price if zone_price is not None else reference
+    flow = _v23975_orderflow_snapshot(zp or 0, bids, asks, trades, now)
+    zones = _v23975_zone_structure(cb, zp, flow)
+    patterns = _v23975_pattern_candidates(_v23975_normalize_bars(pattern_bars)) if pattern_bars else _v23975_pattern_candidates(cb)
+    settle = _v23975_settlement_path(reference, strike, seconds_left, sigma, observed_avg, observed_n, drift)
+    flip = _v23975_first_crossing_path(reference, strike, sigma, seconds_left)
+    return {'at': round(float(now), 3), 'price_source': price_source, 'zones': zones, 'patterns': patterns, 'flow': flow, 'settlement': settle, 'flip': flip, 'experimental': True, 'real_orders_permitted': False}
+
+
+# ============================================================================
+# V23.9.75 — READ-ONLY RAILWAY/MOBILE ENDGAME RESEARCH PORT
+# ============================================================================
+# Target: preserved V23.9.69 Railway Coinbase BTC-USD + Kalshi cloud build.
+# No Bookmap process/feed; no new order submission, policy, or risk overrides.
+# Research panel outputs are *not* calibrated probabilities or trade signals.
+import statistics
+import re as _v23975_re
+
+_V23975_BUILD='23.9.75'
+_V23975_SOURCE='COINBASE BTC-USD + OFFICIAL KALSHI BRTI (IF FRESH)'
+_V23975_LOCK_NAME='LECHART_RAILWAY_V23975_FIRST_LOCKS.jsonl'
+_V23975_RESULTS_NAME='LECHART_RAILWAY_V23975_SETTLED.jsonl'
+_V23975_SNAP_NAME='LECHART_RAILWAY_V23975_FORECASTS.jsonl'
+
+def _v23975_log(name,row):
+    # Reuse the existing Railway volume when configured. Avoid printing secrets.
+    try:
+        base=_v23967_storage_root()
+        with (base/name).open('a',encoding='utf-8') as f:
+            f.write(json.dumps(row,separators=(',',':'),default=str)+'\n')
+    except Exception as exc:
+        print('V23.9.75 ledger warning',str(exc)[:120],flush=True)
+
+def _v23975_closed_bars(app,sec,now,limit=160):
+    # Railway historical 1m OHLC and its Coinbase spot-tick deque only.
+    # Always exclude the currently forming interval; do not synthesize missing bars.
+    end=int(now//sec)*sec
+    if sec==60:
+        try:
+            with _v239226_lock(app): rows=list(getattr(app,'_v226_history_1m',[]) or getattr(app,'btc_1m',[]) or [])
+        except Exception: rows=[]
+        good={}
+        for r in rows:
+            try:
+                t=float(r.get('time',r.get('t')))
+                if t>=end or t < end-3600*5:continue
+                good[int(t)]={'time':int(t),**{k:float(r[k]) for k in ('open','high','low','close')},'volume':float(r.get('volume',0) or 0)}
+            except Exception:continue
+        return [good[t] for t in sorted(good)][-limit:]
+    # The original v2985_brti_ticks label is misleading in Railway: it contains
+    # Coinbase BTC-USD tick prices. Sort by source time; older trades cannot
+    # change the latest close just because they were received last.
+    try:
+        with _v239226_lock(app): ticks=list(getattr(app,'v2985_brti_ticks',[]) or [])
+    except Exception: ticks=[]
+    tick_rows=[]
+    for k,item in enumerate(ticks):
+        try:
+            ts=float(item[0]);px=float(item[1]);
+            if px>1000 and math.isfinite(px) and end-3600<=ts<end:
+                tick_rows.append((ts,k,px))
+        except Exception:continue
+    tick_rows.sort(key=lambda r:(r[0],r[1]))
+    groups={}
+    for ts,k,px in tick_rows:
+        b=int(ts//sec)*sec
+        row=groups.get(b)
+        if row is None:groups[b]={'time':b,'open':px,'high':px,'low':px,'close':px,'volume':0}
+        else:
+            row['high']=max(row['high'],px);row['low']=min(row['low'],px);row['close']=px
+    return [groups[t] for t in sorted(groups)][-limit:]
+
+def _v23975_trades(app,now):
+    try: source=list(_v23924_flow_deque(app))[-2200:]
+    except Exception:source=[]
+    out=[]
+    for t in source:
+        try:
+            ts=float(t.get('ts',0));sz=float(t.get('size',0))
+            if 0<=now-ts<=35 and sz>0:
+                out.append({'received':ts,'size':sz,'aggressor':str(t.get('aggr','')).lower()})
+        except Exception:continue
+    return out
+
+def _v23975_health(app,now,feed,minute,fast):
+    # These are diagnostics, not a promise that an exchange is leading BRTI.
+    ts=float(getattr(app,'_v239226_ts',0) or 0)
+    trade_age=round(max(0.,now-ts),2) if ts else None
+    brti_age=_v23975_num(feed.get('brti_age'))
+    cb=_v23975_num(feed.get('coinbase'));brti=_v23975_num(feed.get('brti'))
+    basis=(cb-brti) if cb is not None and brti is not None else None
+    warnings=[]
+    if trade_age is None or trade_age>4.0:warnings.append('Coinbase trade price stale; wait for live feed')
+    if brti_age is None or brti_age>2.5:warnings.append('Official BRTI stale/unavailable; settlement WAIT')
+    if cb is not None and minute:
+        latest=minute[-1]['close']
+        if abs(cb-latest)>max(40.,cb*.0018):warnings.append('Spot price differs materially from last CLOSED 1m candle; check volatility and feed age')
+    if len(fast)<24:warnings.append('Not enough closed 15s candles for robust short-term structure')
+    return {'coinbase_trade_age_s':trade_age,'brti_reception_age_s':brti_age,
+            'coinbase_btc_usd':cb,'brti':brti,'basis_usd':round(basis,2) if basis is not None else None,
+            'warnings':warnings,'note':'BRTI feed age reflects local reception; independent provider source-time validation is not yet available in this Railway lineage.'}
+
+def _v23975_snapshot(app,now=None):
+    now=float(now if now is not None else time.time())
+    feed=_v23967_feed(app,now)
+    closed=_v23975_closed_bars(app,60,now,160)
+    fast=_v23975_closed_bars(app,15,now,180)
+    health=_v23975_health(app,now,feed,closed,fast)
+    ref=_v23975_num(feed.get('brti'))
+    fresh=ref is not None and health['brti_reception_age_s'] is not None and health['brti_reception_age_s']<=2.5
+    cb=_v23975_num(feed.get('coinbase'))
+    cb_fresh=health['coinbase_trade_age_s'] is not None and health['coinbase_trade_age_s']<=4.0
+    strike=_v23975_num(feed.get('strike'))
+    # Keep price action sourced only from live Coinbase trade data; never use
+    # a stale fallback candle or the BRTI price to invent a spot setup.
+    micro=_v23975_trades(app,now) if cb_fresh else []
+    val=_v23975_score_snapshot(closed if cb_fresh else [],{}, {},micro,now,
+         ref if fresh else None,strike,feed.get('time_left'),
+         _v23967_sigma(getattr(app,'_v23967_brti_hist',[]),now,45) if fresh else None,
+         observed_avg=feed.get('brti_final_avg') if fresh else None,
+         observed_n=feed.get('brti_final_n',0) if fresh else 0,
+         price_source='OFFICIAL BRTI' if fresh else 'BRTI STALE/UNAVAILABLE',
+         drift=0.0,zone_price=cb if cb_fresh else None,
+         pattern_bars=fast if cb_fresh and len(fast)>=24 else (closed if cb_fresh else []))
+    # L2 is NOT acquired by current Railway Coinbase legacy feed, so market-depth
+    # absorption may never be asserted. Treat volume delta as partial trade data.
+    val['flow']['source']='COINBASE EXECUTED TRADES ONLY • NO L2 DEPTH'
+    val['flow']['absorption_confirmed']=False
+    bucket=int(feed.get('bucket') or _v23920_bucket(now))
+    try:lock=dict(_v23967_effective_lock(app,now,False) or {})
+    except Exception:lock={}
+    ticker=str(_v23967_ticker(app) or '')
+    val.update({'build':_V23975_BUILD,'ticker':ticker,'bucket':bucket,'seconds_remaining':feed.get('time_left'),
+            'strike':strike,'coinbase_price':cb if cb_fresh else None,'brti':ref if fresh else None,
+            'brti_fresh':fresh,'coinbase_fresh':cb_fresh,'health':health,
+            'yes_bid':feed.get('yes_bid'),'yes_ask':feed.get('yes_ask'),'lock_live':{'side':str(lock.get('side','WAIT')),'source':lock.get('source'),'locked_at':lock.get('locked_at')},
+            'research_only':True,'model_calibrated':False,
+            'limitations':'Zone scores are heuristic; settlement Gaussian model is uncalibrated; Bookmap-specific absorption unavailable.'})
+    if val['settlement'].get('ready') and str(ticker).upper().startswith('KXBTC15M-'):
+        ask=_v23975_num(feed.get('yes_ask'))
+        if ask is not None:val['model_minus_yes_ask']=round(float(val['settlement']['model_p_up'])-ask,4)
+    return val
+
+def _v23975_grade(ticker,bucket,side):
+    # Do not infer results from Coinbase/BRTI chart; use public Kalshi settlement.
+    if not str(ticker).upper().startswith('KXBTC15M-'):return
+    for i in range(20):
+        if i:time.sleep(30)
+        try:
+            raw=http_json(KALSHI_BASE+'/markets/'+urllib.parse.quote(ticker,safe=''),timeout=9)
+            m=raw.get('market',raw) if isinstance(raw,dict) else {}
+            status=str(m.get('status','')).lower();result=str(m.get('result','')).lower()
+            if str(m.get('ticker','')).upper()!=ticker.upper() or status not in ('settled','finalized') or result not in ('yes','no'):
+                continue
+            # Only map direction if YES title unambiguously states directional semantics.
+            title=str(m.get('yes_sub_title') or m.get('title') or '').lower()
+            up=bool(_v23975_re.search(r'\b(up|rise|increase|higher)\b',title))
+            down=bool(_v23975_re.search(r'\b(down|fall|decrease|lower)\b',title))
+            direction=(('UP' if result=='yes' else 'DOWN') if up and not down else
+                       ('DOWN' if result=='yes' else 'UP') if down and not up else None)
+            row={'at':time.time(),'ticker':ticker,'bucket':bucket,'first_side':side,
+                 'official_result':result,'status':status,'direction':direction,
+                 'first_lock_correct':(side==direction) if direction else None,
+                 'proof':'Kalshi public markets endpoint','pending' :direction is None}
+            _v23975_log(_V23975_RESULTS_NAME,row)
+            return
+        except Exception:continue
+    _v23975_log(_V23975_RESULTS_NAME,{'at':time.time(),'ticker':ticker,'bucket':bucket,
+                                     'first_side':side,'pending':True,'reason':'No confirmed official result within polling budget'})
+
+def _v23975_tick(app,now=None):
+    now=float(now if now is not None else time.time())
+    if now-float(getattr(app,'_v23975_last',0) or 0)<3.0:
+        return getattr(app,'_v23975_snapshot',{'status':'WARMING UP','research_only':True})
+    # Intentionally only one main-thread calculation at a time. No backtest IO here.
+    app._v23975_last=now
+    result=_v23975_snapshot(app,now)
+    old=getattr(app,'_v23975_bucket',None);bucket=result['bucket']
+    if old!=bucket:
+        prev=getattr(app,'_v23975_first',None)
+        if prev and old is not None:
+            threading.Thread(target=_v23975_grade,args=(prev['ticker'],prev['bucket'],prev['side']),daemon=True,
+                             name='V23975-official-grade').start()
+        app._v23975_bucket=bucket;app._v23975_first=None
+    lock=result.get('lock_live') or {};side=str(lock.get('side','WAIT')).upper()
+    started=_v23975_num(lock.get('locked_at'))
+    if (getattr(app,'_v23975_first',None) is None and side in ('UP','DOWN') and started is not None
+        and bucket<=started<=now+1 and 0<=now-started<=4 and result['ticker'].upper().startswith('KXBTC15M-')):
+        first={'ticker':result['ticker'],'bucket':bucket,'side':side,'locked_at':started,'source':lock.get('source')}
+        app._v23975_first=first
+        _v23975_log(_V23975_LOCK_NAME,dict(first,recorded_at=now))
+    result['first_lock']=getattr(app,'_v23975_first',None)
+    opinion=result['settlement'].get('side','WAIT')
+    result['disagreement']=bool(result['first_lock'] and opinion in ('UP','DOWN') and opinion !=result['first_lock']['side'])
+    if now-float(getattr(app,'_v23975_last_log',0) or 0)>=10:
+        _v23975_log(_V23975_SNAP_NAME,{'at':now,'ticker':result['ticker'],'bucket':bucket,
+            'first_lock':result['first_lock'],'settlement':result['settlement'],
+            'zones':result['zones'],'patterns':result['patterns'],'health':result['health']})
+        app._v23975_last_log=now
+    app._v23975_snapshot=result
+    return result
+
+# Mobile API, independent from live Machine policy. No POST route added.
+_V23975_GET_BASE=_V23921Handler.do_GET
+def _v23975_get(self):
+    if self.path.split('?',1)[0]=='/api/endgame75':
+        app=_V23921_APP
+        if app is None:return self._send(503,'application/json',json.dumps({'error':'James starting'}))
+        try:payload=_v23975_tick(app)
+        except Exception as exc:payload={'research_only':True,'error':str(exc)[:200]}
+        return self._send(200,'application/json; charset=utf-8',json.dumps(payload,default=str,separators=(',',':')))
+    return _V23975_GET_BASE(self)
+_V23921Handler.do_GET=_v23975_get
+
+
+
+
+# Independent mobile forecast pane and low-frequency async poll (4s).
+_V23975_PANEL = '<section class="card wide" id="endgame75"><div class="k">V23.9.75 • ZONE / FLIP / ENDGAME • RESEARCH ONLY</div>\n<div class="v" id="m75Head">Reading Coinbase trades and official BRTI…</div>\n<div class="sm" id="m75Zone">Zone structure warming up</div>\n<div class="sm" id="m75Pattern">Patterns warming up</div>\n<div class="sm" id="m75Flow">Executed flow warming up</div>\n<div class="sm" id="m75Touch">Strike-touch windows warming up</div>\n<div class="sm" id="m75Lock">Original-first-lock tracking starting</div>\n<div class="sm" id="m75Health">Data freshness checking…</div>\n<div class="sm" style="opacity:.78">Diagnostic scores are not winning probabilities. No Bookmap depth is used in this Railway build. New analysis does not control entries.</div>\n<button id="m75Export" type="button" style="padding:7px;border:1px solid #475569;border-radius:8px;background:#172536;color:#e2e8f0">Export forecast JSON</button></section>'
+_V23975_JS = "\nfunction m75set(id,txt){const el=document.getElementById(id);if(el)el.textContent=txt}\nfunction m75format(x){const n=Number(x);return x===null||x===undefined||!Number.isFinite(n)?'--':n.toFixed(2)}\nfunction m75render(s){\n if(!s || s.error){m75set('m75Head','FORECAST WAIT • '+(s?.error||'no data'));return}\n window.m75latest=s;\n const e=s.settlement||{},z=s.zones||{},zn=z.zone||{},p=s.patterns||[],f=s.flow||{},h=s.health||{},t=s.flip||{};\n const settle=e.ready?('BRTI AVG MODEL '+(e.side||'WAIT')+' • UP '+(Number(e.model_p_up)*100).toFixed(1)+'% (UNCALIBRATED)'):'SETTLEMENT WAIT • '+(e.reason||'no BRTI');\n m75set('m75Head',settle);\n m75set('m75Zone',zn.center!==undefined?('ZONE '+zn.type+' $'+m75format(zn.center)+' • '+(z.decision||'WAIT')+' • Break '+m75format(z.break_score)+'/100 vs Reject '+m75format(z.reject_score)+'/100 (HEURISTIC)'):'ZONES • '+(z.reason||'WAITING FOR CLOSED 1M BARS'));\n m75set('m75Pattern',p.length?'PATTERNS • '+p.map(x=>x.name+' '+x.state+' @ $'+m75format(x.trigger)).join(' | '):'PATTERNS • WAIT / NONE CONFIRMED');\n m75set('m75Flow','ORDER FLOW • BUY '+m75format(f.buy_btc_35s)+' BTC / SELL '+m75format(f.sell_btc_35s)+' BTC • No L2 book/absorption');\n m75set('m75Touch',t.ready?'STRIKE TOUCH (MODEL) • '+(t.horizons||[]).map(x=>x.by_seconds+'s '+(Number(x.model_touch)*100).toFixed(0)+'%').join(' • '):'STRIKE TOUCH • WAIT FRESH BRTI + VOL');\n const first=s.first_lock||{};m75set('m75Lock','FIRST LOCK • '+(first.side||'WAIT')+(s.disagreement?' • ENDGAME DISAGREES':'')+' • ticker '+(s.ticker||'--'));\n m75set('m75Health','FEED • Coinbase age '+m75format(h.coinbase_trade_age_s)+'s • BRTI age '+m75format(h.brti_reception_age_s)+'s • Basis $'+m75format(h.basis_usd)+(h.warnings?.length?' • ⚠ '+h.warnings.join(' | '):' • No known freshness warnings'));\n}\nasync function m75poll(){try{const r=await fetch('/api/endgame75?'+Date.now(),{cache:'no-store'});m75render(await r.json())}catch(e){m75set('m75Head','ENDGAME FEED ERROR • '+String(e).slice(0,110))}finally{setTimeout(m75poll,4000)}}\ntry{const b=document.getElementById('m75Export');if(b)b.onclick=()=>{const data=window.m75latest;if(!data)return;const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='LECHART_RAILWAY_ENDGAME_V23975.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)};m75poll()}catch(e){}\n"
+if '<div class="grid">' in _V23921_HTML:
+    _V23921_HTML=_V23921_HTML.replace('<div class="grid">','<div class="grid">'+_V23975_PANEL,1)
+else:
+    print('V23.9.75 WARNING: Mobile grid anchor not found',flush=True)
+if '</script></body></html>' in _V23921_HTML:
+    _V23921_HTML=_V23921_HTML.replace('</script></body></html>',_V23975_JS+'\n</script></body></html>',1)
+else:
+    print('V23.9.75 WARNING: Mobile script anchor not found',flush=True)
+_V23921_HTML=_V23921_HTML.replace('LECHART JAMES // RAILWAY MACHINE 23.9.69','LECHART JAMES // RAILWAY MACHINE 23.9.75',1)
+print('LOADED RAILWAY ENDGAME V23.9.75 • READ-ONLY ANALYSIS',flush=True)
+
 if __name__=='__main__':
     print('BOOTING '+_V23967_RELEASE,flush=True)
     _v226_run_standalone()
